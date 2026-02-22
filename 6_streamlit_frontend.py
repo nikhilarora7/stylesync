@@ -3,104 +3,122 @@ import requests
 import os
 from PIL import Image
 
-# --- 1. CONFIGURATION ---
 API_BASE_URL = "http://127.0.0.1:8000"
-# UPDATE THIS PATH to where your H&M images folder is located
-IMAGE_DIR = r"D:\entahhhtainmentttttt\h-and-m-personalized-fashion-recommendations\images" 
+IMAGE_DIR = "./images" # Ensure this points to your H&M images
 
 st.set_page_config(page_title="StyleStream AI", layout="wide")
 
-# --- 2. HELPER FUNCTIONS ---
+# --- HELPER FUNCTIONS ---
 def get_image_path(article_id):
-    """H&M image files are 10 digits long, padded with zeros, stored in subfolders."""
     article_str = str(article_id).zfill(10)
-    subfolder = article_str[:3]
-    filename = f"{article_str}.jpg"
-    return os.path.join(IMAGE_DIR, subfolder, filename)
+    return os.path.join(IMAGE_DIR, article_str[:3], f"{article_str}.jpg")
 
 def fetch_trending():
-    """Calls our FastAPI backend to get the real-time trending list."""
     try:
         response = requests.get(f"{API_BASE_URL}/trending")
         if response.status_code == 200:
             return response.json().get("items", [])
     except:
-        st.error("Could not connect to FastAPI Backend. Is it running?")
+        pass
     return []
 
-def fetch_user_data(username):
-    """Calls FastAPI to log the user in and get their profile."""
-    try:
-        response = requests.get(f"{API_BASE_URL}/user/{username}")
-        if response.status_code == 200:
-            return response.json()
-    except:
-        return None
-    return None
+# --- SESSION STATE INITIALIZATION ---
+if 'logged_in' not in st.session_state:
+    st.session_state.logged_in = False
+    st.session_state.username = ""
+    st.session_state.kaggle_id = ""
+    st.session_state.user_type = ""
+if 'cart' not in st.session_state:
+    st.session_state.cart = []
 
-# --- 3. THE UI: SIDEBAR ---
-st.sidebar.title("StyleStream Control Panel")
-st.sidebar.markdown("Simulate different user states below:")
-
-# The Mock Login Dropdown
-selected_user = st.sidebar.selectbox(
-    "Select User State",
-    ["new_user", "streetwear_fan", "formal_fan"]
-)
-
-# Fetch user data based on selection
-user_data = fetch_user_data(selected_user)
-if user_data:
-    if user_data["status"] == "new_user":
-        st.sidebar.warning("Cold Start: Showing global trending items.")
-    elif user_data["status"] == "returning_user":
-        st.sidebar.success(f"Warm Start: Vector loaded for {user_data['kaggle_id'][:8]}...")
-        st.sidebar.write("ALS Vector Preview:", user_data["vector_preview"])
-
-# --- 4. THE UI: MAIN FEED WITH SESSION STATE ---
-st.title("StyleStream | Live Feed")
-st.markdown("---")
-
-# Initialize Session State (Streamlit's memory)
-if 'current_feed_items' not in st.session_state:
-    st.session_state.current_feed_items = fetch_trending()
-if 'feed_title' not in st.session_state:
-    st.session_state.feed_title = "🔥 Global Trending Right Now"
-
-st.subheader(st.session_state.feed_title)
-
-if not st.session_state.current_feed_items:
-    st.info("Waiting for data... Keep the Kafka Producer and Spark Consumer running!")
-else:
-    cols = st.columns(5)
+# ==========================================
+# UI: LOGIN / SIGNUP PAGE (If not logged in)
+# ==========================================
+if not st.session_state.logged_in:
+    st.title("Welcome to StyleStream")
+    st.markdown("Please log in to access your personalized feed.")
     
-    for idx, article_id in enumerate(st.session_state.current_feed_items):
-        col = cols[idx % 5] 
+    tab1, tab2 = st.tabs(["Login", "Sign Up"])
+    
+    with tab1:
+        st.subheader("Login")
+        st.info("💡 **Hint for testing:** Try logging in with username `1`, `2`, or `3` and password `password123` to test historical H&M users!")
         
-        with col:
-            img_path = get_image_path(article_id)
-            try:
-                img = Image.open(img_path)
-                st.image(img, use_column_width=True)
-                
-                # THE MAGIC BUTTON
-                if st.button(f"Find Similar", key=f"btn_{article_id}_{idx}"):
-                    # When clicked, call the new FastAPI endpoint
-                    response = requests.get(f"{API_BASE_URL}/similar/{article_id}")
-                    if response.status_code == 200:
-                        # Update the screen with the visually similar items!
-                        st.session_state.current_feed_items = response.json().get("items", [])
-                        st.session_state.feed_title = "👁️ Visually Similar Items"
-                        st.rerun() # Force the page to refresh instantly
-                    else:
-                        st.error("No visual matches found for this item.")
-                        
-            except FileNotFoundError:
-                st.info(f"Image Missing\nID: {article_id}")
-                
-# Add a reset button to go back to real-time trending
-st.markdown("---")
-if st.button("⬅️ Back to Live Trending"):
-    st.session_state.current_feed_items = fetch_trending()
-    st.session_state.feed_title = "🔥 Global Trending Right Now"
-    st.rerun()
+        login_user = st.text_input("Username (Type an integer for H&M user)", key="login_user")
+        login_pass = st.text_input("Password", type="password", key="login_pass")
+        
+        if st.button("Login"):
+            res = requests.post(f"{API_BASE_URL}/login", json={"username": login_user, "password": login_pass})
+            if res.status_code == 200:
+                data = res.json()
+                st.session_state.logged_in = True
+                st.session_state.username = data["username"]
+                st.session_state.kaggle_id = data["kaggle_id"]
+                st.session_state.user_type = data["user_type"]
+                st.rerun()
+            else:
+                st.error("Invalid credentials.")
+
+    with tab2:
+        st.subheader("Create a New Account")
+        st.write("Simulate a brand new 'Cold Start' user.")
+        signup_user = st.text_input("New Username", key="signup_user")
+        signup_pass = st.text_input("New Password", type="password", key="signup_pass")
+        
+        if st.button("Sign Up"):
+            res = requests.post(f"{API_BASE_URL}/signup", json={"username": signup_user, "password": signup_pass})
+            if res.status_code == 200:
+                st.success("Account created! You can now log in.")
+            else:
+                st.error(res.json().get("detail", "Signup failed."))
+
+# ==========================================
+# UI: MAIN STOREFRONT (If logged in)
+# ==========================================
+else:
+    # --- TOP NAV BAR ---
+    col1, col2, col3 = st.columns([6, 2, 1])
+    with col1:
+        st.title("StyleStream | Live Feed")
+    with col2:
+        st.write("") # Spacing
+        st.write(f"👤 **{st.session_state.username}** ({st.session_state.user_type.capitalize()} User)")
+    with col3:
+        st.write("") # Spacing
+        if st.button("Logout 🚪"):
+            # Clear all session variables
+            st.session_state.logged_in = False
+            st.session_state.username = ""
+            st.session_state.kaggle_id = ""
+            st.session_state.cart = []
+            st.rerun()
+
+    st.markdown("---")
+
+    # --- SIDEBAR: SHOPPING CART ---
+    st.sidebar.title("🛒 Your Cart")
+    if len(st.session_state.cart) == 0:
+        st.sidebar.write("Your cart is empty.")
+    else:
+        st.sidebar.write(f"Items in cart: {len(st.session_state.cart)}")
+        if st.sidebar.button("Checkout & Buy Now"):
+            st.sidebar.success("Order Complete! Profile updated.")
+            st.session_state.cart = [] # Empty the cart after purchase
+            st.rerun()
+
+    # --- MAIN FEED ---
+    st.subheader("🔥 Global Trending Right Now")
+    
+    trending_items = fetch_trending()
+    if not trending_items:
+        st.info("Waiting for data... Keep the Kafka Producer and Spark Consumer running!")
+    else:
+        cols = st.columns(5)
+        for idx, article_id in enumerate(trending_items):
+            with cols[idx % 5]:
+                img_path = get_image_path(article_id)
+                try:
+                    st.image(Image.open(img_path), use_column_width=True)
+                    st.button("Add to Cart", key=f"cart_{article_id}_{idx}")
+                except FileNotFoundError:
+                    st.info(f"Image Missing\nID: {article_id}")
