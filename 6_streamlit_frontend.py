@@ -4,7 +4,7 @@ import os
 from PIL import Image
 
 API_BASE_URL = "http://127.0.0.1:8000"
-IMAGE_DIR = "./images" # Ensure this points to your H&M images
+IMAGE_DIR = r"D:\entahhhtainmentttttt\h-and-m-personalized-fashion-recommendations\images" # Ensure this points to your H&M images
 
 st.set_page_config(page_title="StyleStream AI", layout="wide")
 
@@ -30,6 +30,8 @@ if 'logged_in' not in st.session_state:
     st.session_state.user_type = ""
 if 'cart' not in st.session_state:
     st.session_state.cart = []
+if 'checkout_success' not in st.session_state:
+    st.session_state.checkout_success = False
 
 # ==========================================
 # UI: LOGIN / SIGNUP PAGE (If not logged in)
@@ -81,44 +83,94 @@ else:
     with col1:
         st.title("StyleStream | Live Feed")
     with col2:
-        st.write("") # Spacing
-        st.write(f"👤 **{st.session_state.username}** ({st.session_state.user_type.capitalize()} User)")
+        st.write("") 
+        st.write(f"👤 **{st.session_state.username}** ({st.session_state.user_type.capitalize()})")
     with col3:
-        st.write("") # Spacing
+        st.write("") 
         if st.button("Logout 🚪"):
-            # Clear all session variables
             st.session_state.logged_in = False
             st.session_state.username = ""
             st.session_state.kaggle_id = ""
             st.session_state.cart = []
+            if 'current_feed' in st.session_state:
+                del st.session_state['current_feed']
             st.rerun()
 
     st.markdown("---")
 
     # --- SIDEBAR: SHOPPING CART ---
     st.sidebar.title("🛒 Your Cart")
+    
+    # 1. The Green Success Popup Logic
+    if st.session_state.checkout_success:
+        st.sidebar.success("✅ Order Placed! Profile Updated.")
+        st.session_state.checkout_success = False # Reset so it disappears on next click
+        
     if len(st.session_state.cart) == 0:
         st.sidebar.write("Your cart is empty.")
     else:
         st.sidebar.write(f"Items in cart: {len(st.session_state.cart)}")
+        
+        # 2. Display Small Cart Thumbnails
+        for item in st.session_state.cart:
+            cart_col1, cart_col2 = st.sidebar.columns([1, 3])
+            img_path = get_image_path(item)
+            try:
+                cart_col1.image(Image.open(img_path), use_column_width=True)
+            except FileNotFoundError:
+                cart_col1.write("N/A")
+            cart_col2.write(f"ID: {str(item)[-6:]}") # Show just the last 6 digits for space
+            
+        # 3. The Checkout Logic
         if st.sidebar.button("Checkout & Buy Now"):
-            st.sidebar.success("Order Complete! Profile updated.")
-            st.session_state.cart = [] # Empty the cart after purchase
+            for item in st.session_state.cart:
+                 requests.post(f"{API_BASE_URL}/interact", json={
+                    "user_id": st.session_state.kaggle_id,
+                    "item_id": str(item),
+                    "action": "purchase"
+                 })
+            st.session_state.cart = [] # Empty cart
+            st.session_state.checkout_success = True # Trigger the popup
             st.rerun()
 
     # --- MAIN FEED ---
     st.subheader("🔥 Global Trending Right Now")
     
-    trending_items = fetch_trending()
-    if not trending_items:
+    if 'current_feed' not in st.session_state:
+        st.session_state.current_feed = fetch_trending()
+        
+    if not st.session_state.current_feed:
         st.info("Waiting for data... Keep the Kafka Producer and Spark Consumer running!")
     else:
         cols = st.columns(5)
-        for idx, article_id in enumerate(trending_items):
+        for idx, article_id in enumerate(st.session_state.current_feed):
             with cols[idx % 5]:
                 img_path = get_image_path(article_id)
                 try:
                     st.image(Image.open(img_path), use_column_width=True)
-                    st.button("Add to Cart", key=f"cart_{article_id}_{idx}")
+                    
+                    # 4. TWO BUTTONS PER ITEM
+                    if st.button("👁️ View Similar", key=f"sim_{article_id}_{idx}"):
+                        # Log the interaction
+                        requests.post(f"{API_BASE_URL}/interact", json={
+                            "user_id": st.session_state.kaggle_id,
+                            "item_id": str(article_id),
+                            "action": "view_similar"
+                        })
+                        # Fetch hybrid recommendations, passing the username!
+                        res = requests.get(f"{API_BASE_URL}/similar/{article_id}?username={st.session_state.username}")
+                        if res.status_code == 200:
+                            st.session_state.current_feed = res.json().get("items", [])
+                            st.rerun()
+
+                    if st.button("🛒 Add to Cart", key=f"cart_{article_id}_{idx}"):
+                        st.session_state.cart.append(article_id)
+                        requests.post(f"{API_BASE_URL}/interact", json={
+                            "user_id": st.session_state.kaggle_id,
+                            "item_id": str(article_id),
+                            "action": "add_to_cart"
+                        })
+                        st.rerun() 
+                        
                 except FileNotFoundError:
                     st.info(f"Image Missing\nID: {article_id}")
