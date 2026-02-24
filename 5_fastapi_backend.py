@@ -9,6 +9,13 @@ import uuid
 from confluent_kafka import Producer
 import time
 import lightgbm as lgb
+import sqlite3
+
+def get_db_connection():
+    """Helper function to open and close DB connections cleanly."""
+    conn = sqlite3.connect('auth.db')
+    conn.row_factory = sqlite3.Row
+    return conn
 
 app = FastAPI(title="StyleStream E-Commerce API")
 r = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
@@ -19,9 +26,6 @@ try:
     visual_index = faiss.read_index("hm_visual_index.faiss")
     faiss_mapping = pd.read_csv("faiss_mapping.csv")
     
-    # Load user mapping so we can log in as historical H&M users!
-    user_mapping = pd.read_csv("user_mapping.csv")
-    print(f"Loaded {len(user_mapping)} H&M users for simulation.")
     try:
         lgb_ranker = lgb.Booster(model_file="lgb_model.txt")
         print("Successfully loaded LightGBM Ranker!")
@@ -40,49 +44,43 @@ class LoginRequest(BaseModel):
     password: str
 
 # --- 3. API ENDPOINTS ---
-
 @app.post("/login")
 def login(req: LoginRequest):
-    """Handles both H&M historical users and newly signed-up users."""
+    conn = get_db_connection()
+    user = conn.execute('SELECT * FROM users WHERE username = ?', (req.username,)).fetchone()
+    conn.close()
     
-    # Check if this is an H&M Historical User (e.g., username is a number like '42')
-    if req.username.isdigit():
-        user_int = int(req.username)
-        # Check if they exist in the Kaggle dataset
-        if user_int in user_mapping['user_id_int'].values:
-            if req.password == "password123":
-                # Success! Fetch their real Kaggle ID
-                kaggle_id = user_mapping.loc[user_mapping['user_id_int'] == user_int, 'customer_id'].values[0]
-                return {"status": "success", "user_type": "historical", "kaggle_id": kaggle_id, "username": req.username}
-            else:
-                raise HTTPException(status_code=401, detail="Invalid password for H&M user. Use password123.")
-    
-    # If not a number, check if it's a new user stored in Redis
-    user_data = r.get(f"auth:{req.username}")
-    if user_data:
-        parsed_data = json.loads(user_data)
-        if parsed_data["password"] == req.password:
-            return {"status": "success", "user_type": "new", "kaggle_id": parsed_data["kaggle_id"], "username": req.username}
-        else:
-            raise HTTPException(status_code=401, detail="Invalid password.")
-            
-    raise HTTPException(status_code=404, detail="User not found.")
+    if user and user['password'] == req.password:
+        return {
+            "status": "success", 
+            "user_type": user['user_type'], 
+            "kaggle_id": user['kaggle_id'], 
+            "username": user['username']
+        }
+    raise HTTPException(status_code=401, detail="Invalid username or password.")
 
 @app.post("/signup")
 def signup(req: LoginRequest):
-    """Creates a new user profile from scratch."""
-    if r.exists(f"auth:{req.username}") or req.username.isdigit():
-        raise HTTPException(status_code=400, detail="Username already exists or is reserved for H&M users.")
+    conn = get_db_connection()
+    user = conn.execute('SELECT * FROM users WHERE username = ?', (req.username,)).fetchone()
+    
+    if user:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Username already exists.")
         
-    # Generate a brand new unique ID for this user
     new_kaggle_id = f"new_user_{uuid.uuid4().hex}"
     
-    # Save to Redis
-    r.set(f"auth:{req.username}", json.dumps({
-        "password": req.password,
-        "kaggle_id": new_kaggle_id
-    }))
-    
+    try:
+        conn.execute(
+            'INSERT INTO users (username, password, kaggle_id, user_type) VALUES (?, ?, ?, ?)',
+            (req.username, req.password, new_kaggle_id, "new")
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail="Error creating account.")
+    finally:
+        conn.close()
+        
     return {"status": "success", "message": "Account created!", "kaggle_id": new_kaggle_id}
 
 # --- KAFKA PRODUCER (Real Telemetry) ---
@@ -143,23 +141,24 @@ def get_hybrid_similar_items(article_id: str, username: str = ""):
         final_ranked_items = visual_candidates_int[:5] # Default fallback
         
         if lgb_ranker and username.isdigit():
-            user_int = int(username)
-            # Fetch the user's real Kaggle ID
-            if user_int in user_mapping['user_id_int'].values:
-                kaggle_id = user_mapping.loc[user_mapping['user_id_int'] == user_int, 'customer_id'].values[0]
+            # --- NEW: Fetch the user's real Kaggle ID from SQLite! ---
+            conn = get_db_connection()
+            user = conn.execute('SELECT kaggle_id FROM users WHERE username = ?', (username,)).fetchone()
+            conn.close()
+            
+            if user:
+                kaggle_id = user['kaggle_id']
                 
                 # Fetch their ALS taste profile from Redis
                 user_vector_json = r.get(f"user:{kaggle_id}")
                 
                 if user_vector_json:
                     user_vector = json.loads(user_vector_json)
+                    user_int = int(username)
                     
                     # 1. Construct the Feature Matrix for LightGBM
-                    # (This matches the exact 2D array format LightGBM expects)
                     features = []
                     for candidate_id in visual_candidates_int:
-                        # Combine: [Item ID, User ID, User Vector Features...]
-                        # Note: In production, you would append the Item's ALS vector here too!
                         row_features = [candidate_id, user_int] + user_vector 
                         features.append(row_features)
                     
@@ -169,7 +168,6 @@ def get_hybrid_similar_items(article_id: str, username: str = ""):
                     scores = lgb_ranker.predict(feature_matrix)
                     
                     # 3. Sort the 20 candidates by highest LightGBM score
-                    # np.argsort sorts lowest to highest, so we reverse it with [::-1]
                     best_indices = np.argsort(scores)[::-1]
                     final_ranked_items = [visual_candidates_int[i] for i in best_indices[:5]]
 
