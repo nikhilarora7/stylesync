@@ -1,1 +1,8 @@
-spark_checkpoints/
+auth.db
+spark_checkpoints_live/
+
+
+
+
+
+

@@ -1,54 +1,104 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from confluent_kafka import Producer
+import ast
 import redis
 import json
 import faiss
 import pandas as pd
 import numpy as np
 import uuid
-from confluent_kafka import Producer
 import time
-import lightgbm as lgb
 import sqlite3
+import lightgbm as lgb
+import os
+
+app = FastAPI(title="StyleStream E-Commerce API")
+
+# --- 1. CONFIGURATION & DATABASE CONNECTIONS ---
+r = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+conf = {'bootstrap.servers': '127.0.0.1:9092', 'client.id': 'fastapi-backend'}
+producer = Producer(conf)
 
 def get_db_connection():
-    """Helper function to open and close DB connections cleanly."""
-    conn = sqlite3.connect('auth.db')
+    # check_same_thread=False allows FastAPI to use multiple worker threads safely
+    conn = sqlite3.connect('auth.db', check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
-app = FastAPI(title="StyleStream E-Commerce API")
-r = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
-
-# --- 1. LOAD DATABASES & MAPPINGS ---
-print("Loading FAISS Visual Index and User Mappings...")
+# --- 2. LOAD MODELS & MAPPINGS ---
+print("Loading Engine Components...")
 try:
+    # Load Visual Search
     visual_index = faiss.read_index("hm_visual_index.faiss")
     faiss_mapping = pd.read_csv("faiss_mapping.csv")
     
-    try:
+    # Load LightGBM Ranker
+    if os.path.exists("lgb_model.txt"):
         lgb_ranker = lgb.Booster(model_file="lgb_model.txt")
-        print("Successfully loaded LightGBM Ranker!")
-    except Exception as e:
+        print("✅ LightGBM Ranker Loaded!")
+    else:
         lgb_ranker = None
-        print(f"Warning: LightGBM model 'lgb_model.txt' not found. Will default to FAISS scoring. ({e})")
+        print("⚠️ LightGBM model not found. Using fallback logic.")
+# --- NEW: LOAD STATIC ALS VECTORS INTO RAM ---
+    try:
+        df_vectors = pd.read_csv("user_vectors.csv")
+        # Convert the string representation of the list back into a real Python list
+        df_vectors['features'] = df_vectors['features'].apply(ast.literal_eval)
+        # Create a blazing fast dictionary lookup: user_int -> feature_list
+        user_vector_dict = dict(zip(df_vectors['id'], df_vectors['features']))
+        print(f"✅ Loaded ALS vectors for {len(user_vector_dict)} users directly into RAM.")
+    except Exception as e:
+        user_vector_dict = {}
+        print(f"⚠️ Warning: user_vectors.csv not found. {e}")
         
-except Exception as e:
-    print(f"Critical Error loading databases: {e}")
-except Exception as e:
-    print(f"Warning: Could not load index or mappings. Error: {e}")
 
-# --- 2. AUTHENTICATION SCHEMAS ---
+except Exception as e:
+    print(f"🔥 Critical Error loading models: {e}")
+
+# --- NEW: SYSTEM INITIALIZATION (The Cold Start Fix) ---
+print("Running System Cold-Start Checks...")
+
+# 1. Force Kafka Topic Creation
+# Sending a single dummy message forces Kafka to auto-create 'live-clicks'
+try:
+    dummy_event = {
+        "user_id": "system_boot",
+        "item_id": "0000000000",
+        "action": "boot",
+        "timestamp": time.time()
+    }
+    producer.produce('live-clicks', value=json.dumps(dummy_event).encode('utf-8'))
+    producer.flush() # Ensure it sends immediately
+    print("✅ Kafka 'live-clicks' channel ready.")
+except Exception as e:
+    print(f"⚠️ Kafka boot warning: {e}")
+
+# 2. Seed Redis so the UI is never blank
+if not r.exists("global_trending"):
+    # We inject 5 hardcoded valid H&M IDs so you have something to click!
+    # (Using random popular items from the FAISS mapping)
+    seed_items = ["0108775015", "0108775044", "0111565001", "0111586001", "0111593001"]
+    r.set("global_trending", json.dumps(seed_items))
+    print("✅ Seeded Redis with default trending items.")
+
+# --- 3. DATA MODELS ---
 class LoginRequest(BaseModel):
     username: str
     password: str
 
-# --- 3. API ENDPOINTS ---
+class Interaction(BaseModel):
+    user_id: str
+    username: str # Added username to track session history
+    item_id: str
+    action: str
+
+# --- 4. AUTH ENDPOINTS ---
 @app.post("/login")
 def login(req: LoginRequest):
-    conn = get_db_connection()
-    user = conn.execute('SELECT * FROM users WHERE username = ?', (req.username,)).fetchone()
-    conn.close()
+    # 'with' automatically closes the connection even if code crashes!
+    with get_db_connection() as conn:
+        user = conn.execute('SELECT * FROM users WHERE username = ?', (req.username,)).fetchone()
     
     if user and user['password'] == req.password:
         return {
@@ -57,125 +107,158 @@ def login(req: LoginRequest):
             "kaggle_id": user['kaggle_id'], 
             "username": user['username']
         }
-    raise HTTPException(status_code=401, detail="Invalid username or password.")
+    raise HTTPException(status_code=401, detail="Invalid credentials.")
 
 @app.post("/signup")
 def signup(req: LoginRequest):
-    conn = get_db_connection()
-    user = conn.execute('SELECT * FROM users WHERE username = ?', (req.username,)).fetchone()
-    
-    if user:
-        conn.close()
-        raise HTTPException(status_code=400, detail="Username already exists.")
+    with get_db_connection() as conn:
+        user = conn.execute('SELECT * FROM users WHERE username = ?', (req.username,)).fetchone()
         
-    new_kaggle_id = f"new_user_{uuid.uuid4().hex}"
-    
-    try:
-        conn.execute(
-            'INSERT INTO users (username, password, kaggle_id, user_type) VALUES (?, ?, ?, ?)',
-            (req.username, req.password, new_kaggle_id, "new")
-        )
-        conn.commit()
-    except sqlite3.IntegrityError:
-        raise HTTPException(status_code=400, detail="Error creating account.")
-    finally:
-        conn.close()
-        
-    return {"status": "success", "message": "Account created!", "kaggle_id": new_kaggle_id}
+        if user:
+            raise HTTPException(status_code=400, detail="Username taken.")
+            
+        new_kaggle_id = f"new_user_{uuid.uuid4().hex}"
+        try:
+            conn.execute(
+                'INSERT INTO users (username, password, kaggle_id, user_type) VALUES (?, ?, ?, ?)',
+                (req.username, req.password, new_kaggle_id, "new")
+            )
+            conn.commit()
+        except:
+            raise HTTPException(status_code=400, detail="Error creating account.")
+            
+    return {"status": "success", "kaggle_id": new_kaggle_id}
 
-# --- KAFKA PRODUCER (Real Telemetry) ---
-conf = {'bootstrap.servers': '127.0.0.1:9092', 'client.id': 'fastapi-backend'}
-producer = Producer(conf)
-
-class Interaction(BaseModel):
-    user_id: str
-    item_id: str
-    action: str
-
+# --- 5. TELEMETRY & TRACKING ---
 @app.post("/interact")
 def record_interaction(interaction: Interaction):
-    """Takes a real click/purchase from the website and injects it into Kafka."""
+    """
+    1. Sends event to Kafka (for Global Trending)
+    2. Saves event to Redis (for Real-time User Profile)
+    """
     try:
+        # --- NEW: Print to terminal so we know FastAPI got it! ---
+        print(f"🎯 UI Click Received: [{interaction.action}] on Item {interaction.item_id}")
+
+        # A. Send to Kafka
         event = {
             "user_id": interaction.user_id,
             "item_id": interaction.item_id,
             "action": interaction.action,
             "timestamp": time.time()
         }
-        # Push to the live Kafka stream!
-        producer.produce('user-clicks', value=json.dumps(event).encode('utf-8'))
-        producer.poll(0) 
+        producer.produce('live-clicks', value=json.dumps(event).encode('utf-8'))
+        
+        # --- THE FIX: Force the buffer to send to Kafka INSTANTLY ---
+        producer.flush() 
+        
+        # B. Save to Redis Session History
+        redis_key = f"history:{interaction.username}"
+        r.lpush(redis_key, interaction.item_id)
+        r.ltrim(redis_key, 0, 19)
+        
         return {"status": "success"}
     except Exception as e:
+        print(f"❌ Interaction Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-    
-@app.get("/trending")
-def get_trending_items():
-    # (Keep your existing trending code here)
+
+# --- 6. RECOMMENDATION ENDPOINTS ---
+
+@app.get("/feed/{username}")
+def get_personalized_feed(username: str):
+    """
+    THE MASTER BLENDER: 2 Historical (ALS+LightGBM) + 3 Viral (PySpark)
+    """
     try:
+        # 1. Fetch Global Trending from PySpark (The Viral Pool)
         trending_data = r.get("global_trending")
-        if trending_data:
-            return {"type": "trending", "items": json.loads(trending_data)}
-        return {"type": "fallback", "items": []}
+        trending_items = json.loads(trending_data) if trending_data else []
+        
+        # 2. Safely Parse the Username (Handling Kaggle's .0 floats)
+        try:
+            user_int = int(float(username))
+            is_historical = True
+        except ValueError:
+            is_historical = False
+            
+        # 3. Handle NEW USERS (100% Viral / Cold Start)
+        if not is_historical or not lgb_ranker or user_int not in user_vector_dict:
+            return {"type": "global_trending", "items": trending_items[:5]}
+            
+        # 4. Handle HISTORICAL USERS (The 2/3 Blend)
+        user_vector = user_vector_dict[user_int]
+        
+        # --- SLOTS 1 & 2: PERSONALIZED RANKING (ALS + LightGBM) ---
+        import random
+        valid_items = faiss_mapping['article_id'].dropna().unique().tolist()
+        candidate_pool = random.sample(valid_items, min(100, len(valid_items)))
+        
+        features = []
+        valid_candidates = []
+        for item_int in candidate_pool:
+            try:
+                row = [item_int, user_int] + user_vector 
+                features.append(row)
+                valid_candidates.append(str(item_int).zfill(10))
+            except:
+                continue
+                
+        # Let LightGBM evaluate the candidate pool
+        scores = lgb_ranker.predict(np.array(features))
+        best_indices = np.argsort(scores)[::-1] 
+        
+        als_recs = []
+        for idx in best_indices:
+            item_str = valid_candidates[idx]
+            if item_str not in als_recs:
+                als_recs.append(item_str)
+            if len(als_recs) == 2: # EXACTLY 2 PERSONALIZED ITEMS
+                break
+
+        # --- SLOTS 3, 4 & 5: LIVE TRENDING (PySpark) ---
+        trending_recs = []
+        for t in trending_items:
+            # Prevent showing the same item twice if it's both personalized AND trending
+            if t not in als_recs: 
+                trending_recs.append(t)
+            if len(trending_recs) == 3: # EXACTLY 3 VIRAL ITEMS
+                break
+                
+        # --- THE FINAL BLEND ---
+        final_feed = als_recs + trending_recs
+        
+        # Safety Fallback: Guarantee exactly 5 images render if pools were empty
+        if len(final_feed) < 5:
+            for t in valid_items:
+                t_str = str(t).zfill(10)
+                if t_str not in final_feed:
+                    final_feed.append(t_str)
+                if len(final_feed) == 5:
+                    break
+                    
+        return {"type": "blended_feed", "items": final_feed}
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Feed Error: {e}")
+        return {"type": "error", "items": []}
 
 @app.get("/similar/{article_id}")
-def get_hybrid_similar_items(article_id: str, username: str = ""):
-    """Two-Stage Hybrid: FAISS Visual Candidates + LightGBM Historical Ranking"""
+def get_similar_items(article_id: str):
+    """
+    Visual Similarity Endpoint (Strictly Visual as requested)
+    """
     try:
-        # --- STAGE 1: CANDIDATE GENERATION (FAISS) ---
         row_indices = faiss_mapping.index[faiss_mapping['article_id'] == int(article_id)].tolist()
         if not row_indices:
-             return {"type": "hybrid_similarity", "items": []}
-             
+             return {"type": "visual", "items": []}
+        
         row_idx = row_indices[0]
         vector = visual_index.reconstruct(row_idx)
+        distances, indices = visual_index.search(np.array([vector]), 6)
         
-        # Fetch 20 visual candidates
-        distances, indices = visual_index.search(np.array([vector]), 20) 
-        similar_indices = indices[0][1:]
-        visual_candidates_int = faiss_mapping.iloc[similar_indices]['article_id'].tolist()
+        similar_ids = faiss_mapping.iloc[indices[0][1:]]['article_id'].astype(str).tolist()
+        similar_ids = [s.zfill(10) for s in similar_ids]
         
-        # --- STAGE 2: THE HISTORICAL RANKER (LightGBM) ---
-        final_ranked_items = visual_candidates_int[:5] # Default fallback
-        
-        if lgb_ranker and username.isdigit():
-            # --- NEW: Fetch the user's real Kaggle ID from SQLite! ---
-            conn = get_db_connection()
-            user = conn.execute('SELECT kaggle_id FROM users WHERE username = ?', (username,)).fetchone()
-            conn.close()
-            
-            if user:
-                kaggle_id = user['kaggle_id']
-                
-                # Fetch their ALS taste profile from Redis
-                user_vector_json = r.get(f"user:{kaggle_id}")
-                
-                if user_vector_json:
-                    user_vector = json.loads(user_vector_json)
-                    user_int = int(username)
-                    
-                    # 1. Construct the Feature Matrix for LightGBM
-                    features = []
-                    for candidate_id in visual_candidates_int:
-                        row_features = [candidate_id, user_int] + user_vector 
-                        features.append(row_features)
-                    
-                    feature_matrix = np.array(features)
-                    
-                    # 2. Predict the Probability of Purchase!
-                    scores = lgb_ranker.predict(feature_matrix)
-                    
-                    # 3. Sort the 20 candidates by highest LightGBM score
-                    best_indices = np.argsort(scores)[::-1]
-                    final_ranked_items = [visual_candidates_int[i] for i in best_indices[:5]]
-
-        # Format back to 10-digit strings for the UI images
-        final_ranked_items = [str(s).zfill(10) for s in final_ranked_items]
-        
-        return {"type": "hybrid_similarity", "items": final_ranked_items}
-        
+        return {"type": "visual", "items": similar_ids}
     except Exception as e:
-        print(f"Server Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
