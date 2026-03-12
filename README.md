@@ -12,7 +12,8 @@ The pipeline is built on a modern, decoupled microservices architecture designed
 4. **Stream Processing (PySpark):** Consumes Kafka events, applies a weighted scoring algorithm (`View=1`, `Cart=3`, `Purchase=10`), and calculates live global trends.
 5. **In-Memory Cache (Redis):** Stores the live trending leaderboard for instant retrieval by the backend.
 6. **Machine Learning Pipeline:**
-   - **Candidate Generation:** FAISS (Facebook AI Similarity Search) for visual product similarity.
+    - **Image Embeddings:** Visual embeddings made by ResNet16.
+   - **Candidate Generation:** FAISS (Facebook AI Similarity Search) for visual product similarity using the image embeddings.
    - **Latent Feature Extraction:** ALS (Alternating Least Squares) Matrix Factorization for user/item historical profiles.
    - **Ranking:** LightGBM pairwise ranker predicts the exact probability of a user purchasing a candidate item.
 
