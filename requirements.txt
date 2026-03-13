@@ -1,0 +1,17 @@
+# Web Framework & UI
+fastapi
+uvicorn
+streamlit
+requests
+
+# Data Engineering & Streaming
+pyspark
+confluent-kafka
+redis
+
+# Machine Learning & Data Processing
+pandas
+numpy
+lightgbm
+faiss-cpu
+Pillow

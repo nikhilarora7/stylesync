@@ -1,53 +1,55 @@
-import pandas as pd
-import json
-import time
 from confluent_kafka import Producer
+import pandas as pd
+import time
+import json
+import random
 
-# --- 1. CONFIGURATION ---
-# Confluent Kafka uses a simple dictionary for configuration
-conf = {
-    'bootstrap.servers': '127.0.0.1:9092', # FORCED IPv4
-    'client.id': 'stylestream-producer'
-}
-
+# --- CONFIGURATION ---
+TOPIC = "user-clicks"
+conf = {'bootstrap.servers': '127.0.0.1:9092'}
 producer = Producer(conf)
-TOPIC_NAME = 'user-clicks'
 
-# --- 2. DELIVERY CALLBACK ---
-# This function triggers automatically to confirm if a message was successfully delivered
+print("Loading data...")
+# Load the transactions we generated earlier
+df = pd.read_csv("transactions_sample.csv")
+
 def delivery_report(err, msg):
     if err is not None:
         print(f"Message delivery failed: {err}")
-    else:
-        print(f"Emitted Event: User {json.loads(msg.value().decode('utf-8'))['user_id'][:8]}... clicked item")
 
-# --- 3. LOAD DATA & STREAM ---
-print("Loading local transaction sample...")
-df_transactions = pd.read_csv("transactions_sample.csv", nrows=5000)
+print(f"Starting to produce events to topic '{TOPIC}'...")
 
-print(f"Starting simulated traffic stream to Kafka topic: '{TOPIC_NAME}'...")
+try:
+    # Loop through the CSV and send events
+    for index, row in df.iterrows():
+        # Create a random action to simulate real traffic weighting
+        # 80% views, 15% carts, 5% purchases
+        action = random.choices(
+            ["view", "add_to_cart", "purchase"], 
+            weights=[80, 15, 5]
+        )[0]
+        
+        event = {
+            "user_id": str(row['customer_id']),
+            "item_id": str(row['article_id']),
+            "action": action, 
+            "timestamp": time.time()
+        }
+        
+        producer.produce(
+            TOPIC, 
+            value=json.dumps(event).encode('utf-8'), 
+            callback=delivery_report
+        )
+        producer.poll(0)
+        
+        # Print every 10 events just to show it's working
+        if index % 10 == 0:
+            print(f"Sent {action} event for item {event['item_id']}")
+            
+        time.sleep(0.5) # Send 2 events per second
 
-for index, row in df_transactions.iterrows():
-    # Construct the JSON payload
-    event = {
-        "user_id": str(row['customer_id']),
-        "item_id": str(row['article_id']),
-        "action": "click",
-        "timestamp": time.time()
-    }
-    
-    # Push to Kafka using the official library
-    # We must explicitly convert the dictionary to a JSON string, then encode it to bytes
-    producer.produce(
-        TOPIC_NAME, 
-        value=json.dumps(event).encode('utf-8'), 
-        callback=delivery_report
-    )
-    
-    # Trigger any available delivery report callbacks
-    producer.poll(0)
-    
-    time.sleep(1)
-
-# Wait for any outstanding messages to be delivered and delivery report callbacks to be triggered.
-producer.flush()
+except KeyboardInterrupt:
+    print("Stopped by user.")
+finally:
+    producer.flush()

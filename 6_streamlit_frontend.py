@@ -3,104 +3,180 @@ import requests
 import os
 from PIL import Image
 
-# --- 1. CONFIGURATION ---
+# --- CONFIGURATION ---
 API_BASE_URL = "http://127.0.0.1:8000"
-# UPDATE THIS PATH to where your H&M images folder is located
-IMAGE_DIR = r"D:\entahhhtainmentttttt\h-and-m-personalized-fashion-recommendations\images" 
+IMAGE_DIR = r"D:\entahhhtainmentttttt\h-and-m-personalized-fashion-recommendations\images" # Ensure this points to your H&M images
 
 st.set_page_config(page_title="StyleStream AI", layout="wide")
 
-# --- 2. HELPER FUNCTIONS ---
-def get_image_path(article_id):
-    """H&M image files are 10 digits long, padded with zeros, stored in subfolders."""
-    article_str = str(article_id).zfill(10)
-    subfolder = article_str[:3]
-    filename = f"{article_str}.jpg"
-    return os.path.join(IMAGE_DIR, subfolder, filename)
+# --- SESSION STATE ---
+if 'logged_in' not in st.session_state:
+    st.session_state.logged_in = False
+    st.session_state.username = ""
+    st.session_state.kaggle_id = ""
+    st.session_state.user_type = ""
+if 'cart' not in st.session_state:
+    st.session_state.cart = []
+if 'checkout_success' not in st.session_state:
+    st.session_state.checkout_success = False
 
-def fetch_trending():
-    """Calls our FastAPI backend to get the real-time trending list."""
+# --- HELPER FUNCTIONS ---
+def get_image_path(article_id):
+    article_str = str(article_id).zfill(10)
+    return os.path.join(IMAGE_DIR, article_str[:3], f"{article_str}.jpg")
+
+def fetch_feed(username):
+    """Fetches the smart feed (Global for New, Hybrid for Old)"""
     try:
-        response = requests.get(f"{API_BASE_URL}/trending")
+        # We pass the username so FastAPI knows which algorithm to use
+        response = requests.get(f"{API_BASE_URL}/feed/{username}")
         if response.status_code == 200:
             return response.json().get("items", [])
     except:
-        st.error("Could not connect to FastAPI Backend. Is it running?")
+        return []
     return []
 
-def fetch_user_data(username):
-    """Calls FastAPI to log the user in and get their profile."""
+def send_interaction(item_id, action):
+    """Sends real telemetry to Kafka + Redis"""
     try:
-        response = requests.get(f"{API_BASE_URL}/user/{username}")
-        if response.status_code == 200:
-            return response.json()
+        requests.post(f"{API_BASE_URL}/interact", json={
+            "user_id": st.session_state.kaggle_id,
+            "username": st.session_state.username,
+            "item_id": str(item_id),
+            "action": action
+        })
     except:
-        return None
-    return None
+        pass
 
-# --- 3. THE UI: SIDEBAR ---
-st.sidebar.title("StyleStream Control Panel")
-st.sidebar.markdown("Simulate different user states below:")
-
-# The Mock Login Dropdown
-selected_user = st.sidebar.selectbox(
-    "Select User State",
-    ["new_user", "streetwear_fan", "formal_fan"]
-)
-
-# Fetch user data based on selection
-user_data = fetch_user_data(selected_user)
-if user_data:
-    if user_data["status"] == "new_user":
-        st.sidebar.warning("Cold Start: Showing global trending items.")
-    elif user_data["status"] == "returning_user":
-        st.sidebar.success(f"Warm Start: Vector loaded for {user_data['kaggle_id'][:8]}...")
-        st.sidebar.write("ALS Vector Preview:", user_data["vector_preview"])
-
-# --- 4. THE UI: MAIN FEED WITH SESSION STATE ---
-st.title("StyleStream | Live Feed")
-st.markdown("---")
-
-# Initialize Session State (Streamlit's memory)
-if 'current_feed_items' not in st.session_state:
-    st.session_state.current_feed_items = fetch_trending()
-if 'feed_title' not in st.session_state:
-    st.session_state.feed_title = "🔥 Global Trending Right Now"
-
-st.subheader(st.session_state.feed_title)
-
-if not st.session_state.current_feed_items:
-    st.info("Waiting for data... Keep the Kafka Producer and Spark Consumer running!")
-else:
-    cols = st.columns(5)
+# ==========================================
+# UI: LOGIN / SIGNUP
+# ==========================================
+if not st.session_state.logged_in:
+    st.title("StyleStream AI")
+    st.subheader("Real-Time Hybrid Recommendation Engine")
     
-    for idx, article_id in enumerate(st.session_state.current_feed_items):
-        col = cols[idx % 5] 
-        
-        with col:
-            img_path = get_image_path(article_id)
+    tab1, tab2 = st.tabs(["Login", "Sign Up"])
+    
+    with tab1:
+        u = st.text_input("Username", key="login_user")
+        p = st.text_input("Password", type="password", key="login_pass")
+        if st.button("Login"):
             try:
-                img = Image.open(img_path)
-                st.image(img, use_column_width=True)
-                
-                # THE MAGIC BUTTON
-                if st.button(f"Find Similar", key=f"btn_{article_id}_{idx}"):
-                    # When clicked, call the new FastAPI endpoint
-                    response = requests.get(f"{API_BASE_URL}/similar/{article_id}")
-                    if response.status_code == 200:
-                        # Update the screen with the visually similar items!
-                        st.session_state.current_feed_items = response.json().get("items", [])
-                        st.session_state.feed_title = "👁️ Visually Similar Items"
-                        st.rerun() # Force the page to refresh instantly
-                    else:
-                        st.error("No visual matches found for this item.")
+                res = requests.post(f"{API_BASE_URL}/login", json={"username": u, "password": p})
+                if res.status_code == 200:
+                    data = res.json()
+                    st.session_state.logged_in = True
+                    st.session_state.username = data["username"]
+                    st.session_state.kaggle_id = data["kaggle_id"]
+                    st.session_state.user_type = data["user_type"]
+                    
+                    # --- NEW: Force memory wipe on fresh login ---
+                    if 'current_feed' in st.session_state:
+                        del st.session_state['current_feed']
                         
-            except FileNotFoundError:
-                st.info(f"Image Missing\nID: {article_id}")
-                
-# Add a reset button to go back to real-time trending
-st.markdown("---")
-if st.button("⬅️ Back to Live Trending"):
-    st.session_state.current_feed_items = fetch_trending()
-    st.session_state.feed_title = "🔥 Global Trending Right Now"
-    st.rerun()
+                    st.rerun()
+                else:
+                    st.error("Invalid credentials.")
+            except Exception as e:
+                st.error(f"Connection Error: {e}")
+
+    with tab2:
+        nu = st.text_input("New Username", key="signup_user")
+        np_pass = st.text_input("New Password", type="password", key="signup_pass")
+        if st.button("Sign Up"):
+            try:
+                res = requests.post(f"{API_BASE_URL}/signup", json={"username": nu, "password": np_pass})
+                if res.status_code == 200:
+                    st.success("Account created! Go to Login.")
+                else:
+                    st.error("Signup failed.")
+            except:
+                st.error("Backend offline.")
+
+# ==========================================
+# UI: STOREFRONT
+# ==========================================
+else:
+    # Header
+    c1, c2, c3 = st.columns([6, 2, 1])
+    c1.title("StyleStream | Live Feed")
+    c2.write(f"👤 **{st.session_state.username}**")
+    if c3.button("Logout"):
+        st.session_state.logged_in = False
+        st.session_state.username = ""
+        st.session_state.kaggle_id = ""
+        st.session_state.user_type = ""
+        st.session_state.cart = []
+        if 'current_feed' in st.session_state:
+            del st.session_state['current_feed']
+            
+        st.rerun()
+    st.markdown("---")
+
+    # Sidebar Cart
+    st.sidebar.title("🛒 Cart")
+    if st.session_state.checkout_success:
+        st.sidebar.success("✅ Order Placed!")
+        st.session_state.checkout_success = False
+
+    if st.session_state.cart:
+        for item in st.session_state.cart:
+            sc1, sc2 = st.sidebar.columns([1,3])
+            try:
+                sc1.image(Image.open(get_image_path(item)), use_column_width=True)
+            except:
+                sc1.write("img")
+            sc2.write(f"ID: {item[-6:]}")
+        
+        if st.sidebar.button("Checkout"):
+            for item in st.session_state.cart:
+                send_interaction(item, "purchase")
+            st.session_state.cart = []
+            st.session_state.checkout_success = True
+            st.rerun()
+    else:
+        st.sidebar.write("Empty")
+
+    # MAIN FEED LOGIC
+    if 'current_feed' not in st.session_state:
+        # Fetch the personalized feed on first load
+        st.session_state.current_feed = fetch_feed(st.session_state.username)
+
+    # Dynamic Title based on User Type
+    if st.session_state.user_type == "historical":
+        st.subheader("✨ Recommended For You (Hybrid LightGBM)")
+    else:
+        st.subheader("🔥 Global Trending (Real-Time)")
+
+    if not st.session_state.current_feed:
+        st.info("Generating feed... (If new, click items to generate trends!)")
+    else:
+        cols = st.columns(5)
+        for idx, article_id in enumerate(st.session_state.current_feed):
+            with cols[idx % 5]:
+                try:
+                    st.image(Image.open(get_image_path(article_id)), use_column_width=True)
+                    
+                    # Button 1: View Similar
+                    if st.button("👁️ Similar", key=f"sim_{idx}"):
+                        send_interaction(article_id, "view_similar")
+                        # Call visual endpoint
+                        res = requests.get(f"{API_BASE_URL}/similar/{article_id}")
+                        if res.status_code == 200:
+                            st.session_state.current_feed = res.json().get("items", [])
+                            st.rerun()
+
+                    # Button 2: Add to Cart
+                    if st.button("🛒 Add", key=f"add_{idx}"):
+                        st.session_state.cart.append(article_id)
+                        send_interaction(article_id, "add_to_cart")
+                        st.rerun()
+                        
+                except FileNotFoundError:
+                    st.caption("Image N/A")
+    
+    # Reset Button
+    st.markdown("---")
+    if st.button("🏠 Back to Home Feed"):
+        st.session_state.current_feed = fetch_feed(st.session_state.username)
+        st.rerun()
